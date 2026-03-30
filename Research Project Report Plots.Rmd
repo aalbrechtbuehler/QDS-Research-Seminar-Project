@@ -1,0 +1,1005 @@
+
+```{r global}
+
+library(pacman)
+p_load(papaja, beeswarm, ggplot2, dplyr, readxl, tinytex, emmeans, tidyr, afex, wesanderson, plotly, htmlwidgets, magick, ggridges, purrr, forcats, viridis, pals, paletteer)
+
+set.seed(123)
+
+#### data wrangling ####
+
+speciesList <- c('bre', 'mil', 'mul', 'oce', 'orn', 'pul')
+
+# read data
+dat <- read.csv("PrettyDat.csv")
+
+
+#expand dat into set of discrete time series by trial_id, sequence_id, and fish_id
+expanded <- dat %>%
+  arrange(trial_id, sequence_id, order_id, fish_id, species) %>%
+  group_by(trial_id, sequence_id, fish_id, species) %>%
+  summarise(
+    series = list(rep(state, length)),
+    .groups = "drop"
+  )
+
+### conditional length calculations
+
+# add next state and length column for easier indexing
+dat2 <- dat %>%
+  arrange(trial_id, sequence_id, order_id, fish_id, species) %>%
+  group_by(trial_id, sequence_id, fish_id, species) %>%
+  mutate(
+    next_state  = lead(state),
+    next_length = lead(length)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(next_state))
+
+#calculate average conditional length of state
+lengthConds <- dat2 %>%
+  group_by(state, next_state, species) %>%
+  summarise(mean_next_length = mean(next_length), .groups = "drop")
+
+# format for plotting
+lengthConds <- lengthConds %>%
+  mutate(
+    state = factor(state),
+    next_state = factor(next_state),
+    #x = as.numeric(state),
+    #y = as.numeric(next_state),
+    #x_offset = ifelse(fish_id == "dom", -0.25, 0.25)
+  )
+
+### conditional state distributions ###
+
+# duplicate stagger sequence by 1 to get prev/next state pairings at every timepoint t
+get.transitions <- function(seq) {
+  if (length(seq) < 2) {
+    return(NULL)
+  }
+  data.frame(
+    prev = head(seq, -1),
+    nex = tail(seq, -1),
+    stringsAsFactors = FALSE
+  )
+}
+
+fullProbs <- NULL
+
+# filtered version without same-state transitions
+fullProbsF <- NULL
+
+for (specie in speciesList) { #for each species:
+  
+  #subset
+  sExpanded <- expanded[expanded$species==specie,]
+  
+  #get transitions
+  sTransitions <- lapply(sExpanded$series, get.transitions)
+  sTransitions <- bind_rows(sTransitions, .id = "id")
+  
+  #for filtered version, remove same-state transitions
+  sTransitionsF <- sTransitions %>%
+  filter(prev != nex)
+  
+  #proportion of transitions
+  sProbs <- sTransitions %>%
+    group_by(id, prev, nex) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(id, prev) %>%
+    mutate(prob = n / sum(n)) %>%
+    ungroup()
+  
+  #filtered
+  sProbsF <- sTransitionsF %>%
+    group_by(id, prev, nex) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(id, prev) %>%
+    mutate(prob = n / sum(n)) %>%
+    ungroup()
+  
+  
+  sProbs$species = specie
+  sProbsF$species = specie
+  
+  fullProbs <- rbind(fullProbs, sProbs)
+  fullProbsF <- rbind(fullProbsF, sProbsF)
+  
+}
+
+```
+
+# Useful Numbers
+
+```{r nums}
+
+speciesList <- c('bre', 'mil', 'mul', 'oce', 'orn', 'pul')
+
+for (s in speciesList){
+  
+  temp <- expanded[expanded$species==s,]
+  
+  # calcs
+  nSeq <- nrow(temp)
+  nInts <- nSeq/2
+  seqQuant75 = quantile(nchar(temp$series), probs = .75)
+  seqQuant50 = quantile(nchar(temp$series), probs = .50)
+  meanL <- mean(nchar(temp$series))
+  minL <- min(nchar(temp$series))
+  maxL <- max(nchar(temp$series))
+  
+  cat(
+  s, ":\n",
+  "Number of Sequences:", nSeq, "\n",
+  "Number of Interactions:", nInts, "\n",
+  "Min Sequence Length:", minL, "\n",
+  "Max Sequence Length:", maxL, "\n",
+  "Sequence Length (mode):", seqQuant50, "\n", 
+  "Sequence Length (upper quantile):", seqQuant75, "\n\n"
+)
+
+}
+
+# sequence length histogram (also shows count)
+ggplot(expanded, aes(x = nchar(series), fill = species, group = species)) +
+  geom_histogram(bins = 20)+
+  facet_wrap(~species, scales = "free_y")+
+  scale_fill_paletteer_d("rcartocolor::Prism", guide = "none")+
+  scale_x_log10(breaks = c(100, 1000, 10000, 100000), labels = c('1e2', '1e3', '1e4', '1e5'))+
+  labs(x = "Length of Sequence", y = "Count")+
+  theme_apa()
+
+```
+
+# Initial Analyses
+
+Understanding the structure of fish posture first requires knowledge of:
+
+1. how long each state lasts: average length
+2. how long one state lasts, conditional on previous state(s): conditional average length
+3. how often each state occurs: state distributions
+4. what state comes next, conditional on previous state: conditional state distributions
+5. the extent of memory within the system: tau-lagged eigenvector decay
+6. whether state probabilities shift dynamically: transition probabilities as a function of lag
+
+## 1. Average State Length
+
+```{r 1}
+
+ggplot(dat, aes(x = state, y = length, fill = species, group = species)) +
+  stat_summary(fun = mean, geom = "bar", position = "dodge")+
+  facet_wrap(~species)+
+  scale_fill_paletteer_d("rcartocolor::Prism", guide = "none")+
+  labs(y = "Length of State", x = "State")+
+  theme_apa()
+
+```
+
+## 2. Conditional Average Next State Length
+
+```{r 2}
+
+ggplot(lengthConds,
+       aes(state, next_state, fill = log10(mean_next_length))) +
+  geom_tile() +
+  facet_wrap(~ species) +
+  scale_fill_paletteer_c("ggthemes::Red-Gold")+
+  labs(fill = "Mean Length (Log10)", y = "Next State", x = "Previous State")+
+  coord_equal() +
+  theme_minimal()+
+  theme(panel.grid = element_line(color = "gray85", size = 0.25,linetype = 2), 
+        panel.spacing = unit(3, "lines"))
+
+```
+
+## 3. State Distributions
+
+```{r 3}
+
+# ggplot(dat, aes(x = state, y = after_stat(prop), fill = species, group = species)) +
+#   geom_bar(stat = "count", position = "dodge", color = NA) +
+#   scale_fill_paletteer_d("rcartocolor::Prism", name = "Species")+
+#   labs(y = "Proportion Time Spent in State", x = "State")+
+#   theme_apa()
+
+state_time <- dat %>%
+  group_by(species, state) %>%
+  summarise(total_length = sum(length), .groups = "drop") %>%
+  group_by(species) %>%
+  mutate(prop_time = total_length / sum(total_length)) %>%
+  ungroup()
+
+ggplot(state_time, aes(x = state, y = prop_time, fill = species, group = species)) +
+  facet_wrap(~species)+
+  geom_bar(stat = "identity", position = "dodge", color = NA) +
+  scale_fill_paletteer_d("rcartocolor::Prism", guide = "none") +
+  labs(y = "Proportion Time Spent in State", x = "State") +
+  theme_apa()
+
+```
+
+## 4. Conditional State Distributions
+
+```{r 4}
+
+# unfiltered
+
+# ggplot(fullProbs, aes(x = prev, y = n, fill = fct_rev(factor(nex, levels = sort(unique(nex)))))) +
+#   geom_bar(stat = "identity", position = "fill") +
+#   facet_wrap(~ fish, labeller = as_labeller(c(dom = "Dom", sub = "Sub")))+
+#   labs(x = "Previous State", y = "Proportion of Transitions", fill = "Next State") +
+#   scale_fill_paletteer_d("rcartocolor::Prism")+
+#   theme_minimal()
+
+
+
+# filtered
+ggplot(fullProbsF, aes(x = prev, y = n, fill = fct_rev(factor(nex, levels = sort(unique(nex)))))) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(~ species)+
+  labs(x = "Previous State", y = "Proportion of Transitions", fill = "Next State") +
+  scale_fill_paletteer_d("rcartocolor::Prism")+
+  theme_minimal()
+
+
+# list of unique combos
+fullProbsF %>%
+  group_by(species, prev) %>%
+  summarise(nex_set = paste(sort(unique(nex)), collapse = ", "),
+            .groups = "drop") %>%
+  group_split(species) %>%
+  walk(function(x) {
+    cat("Species:", unique(x$species), "\n")
+    
+    apply(x, 1, function(row) {
+      cat("Prev =", row["prev"], ": Nexts =", row["nex_set"], "\n")
+    })
+    
+    cat("\n")
+  })
+
+```
+
+## 5. Memory within the System (Eigenvalue Decay Rate)
+
+```{r}
+lagT <- function(seqs, tau) {
+  
+  states <- sort(unique(unlist(seqs)))
+  n <- length(states)
+  state_idx <- setNames(seq_along(states), states)
+  
+  mat <- matrix(0, nrow=n, ncol=n, dimnames=list(states, states))
+  
+  for (seq in seqs) {
+    if (length(seq) <= tau) next
+    
+    #create transition matrix at lag tau
+    for (i in 1:(length(seq) - tau)) {
+      from <- as.character(seq[i])
+      to   <- as.character(seq[i + tau])
+      mat[from, to] <- mat[from, to] + 1
+    }
+  }
+  
+  #row-normalize (rows = "from" states)
+  row_sums <- rowSums(mat)
+  mat <- mat / ifelse(row_sums > 0, row_sums, 1)
+  return(mat)
+}
+
+#first order markov tau is just T(1)^tau
+matrixPower <- function(M, tau) {
+  result <- diag(nrow(M))
+  base <- M
+  while (tau > 0) {
+    if (tau %% 2 == 1) result <- result %*% base
+    base <- base %*% base
+    tau <- tau %/% 2
+  }
+  return(result)
+}
+
+#### visualizations ####
+
+tau_values <- c(1, 50, 100, 200, 500, 1000, 2500, 5000, 7500, 10000, 15000) #upper quantile of sequence length is ~10,000 for each species
+n_modes <- 5  # plot top 5 non-trivial eigenvalues (mu = 2->6 in paper)
+
+speciesList <- c('bre', 'mil', 'mul', 'oce', 'orn', 'pul')
+
+colors <- paletteer_d("rcartocolor::Prism")
+mycols <- colors[4:9]
+
+
+for (specie in speciesList) {
+  dat3 <- dat %>%
+    filter(species == specie) %>%
+    arrange(trial_id, sequence_id, fish_id, order_id)
+  
+  trueSeqs <- dat3 %>%
+    group_by(trial_id, sequence_id, fish_id) %>%
+    summarise(series = list(as.character(rep(state, length))), .groups = "drop") %>%
+    pull(series)
+  
+  # Q3 of sequence lengths
+  seq_lengths <- sapply(trueSeqs, length)
+  q3_len      <- quantile(seq_lengths, 0.75)
+  
+  #T(1) empirical
+  P1 <- lagT(trueSeqs, tau = 1)
+  
+  #init
+  eig_empirical <- matrix(NA, nrow=length(tau_values), ncol=n_modes)
+  eig_markov    <- matrix(NA, nrow=length(tau_values), ncol=n_modes)
+  
+  for (k in seq_along(tau_values)) {
+    tau <- tau_values[k]
+    
+    Ptau <- lagT(trueSeqs, tau)
+    
+    ev_emp <- sort(Mod(eigen(Ptau, only.values=TRUE)$values), decreasing=TRUE)
+    eig_empirical[k, ] <- ev_emp[2:(n_modes+1)]
+    
+    ev_1 <- sort(Mod(eigen(P1, only.values=TRUE)$values), decreasing=TRUE)
+    eig_markov[k, ] <- ev_1[2:(n_modes+1)]^tau
+  }
+  
+  # Build tidy long-format data frames
+  mode_labels <- paste0("i==", 2:(n_modes+1))
+  
+  df_emp <- as.data.frame(eig_empirical) %>%
+    setNames(mode_labels) %>%
+    mutate(tau = tau_values) %>%
+    pivot_longer(-tau, names_to="mode", values_to="lambda") %>%
+    mutate(type = "Empirical")
+  
+  df_mkv <- as.data.frame(eig_markov) %>%
+    setNames(mode_labels) %>%
+    mutate(tau = tau_values) %>%
+    pivot_longer(-tau, names_to="mode", values_to="lambda") %>%
+    mutate(type = "Markov prediction")
+  
+  df_plot <- bind_rows(df_emp, df_mkv)
+  
+  max_tau <- max(tau_values)
+  
+  p <- ggplot(df_plot, aes(x=tau, y=lambda, color=mode, linetype=type, group=interaction(mode, type))) +
+    geom_line(linewidth=0.8) +
+    geom_point(data = filter(df_plot, type == "Empirical"), size=2) +
+    # Q3 shaded overlay
+    annotate("rect",
+             xmin = q3_len, xmax = max_tau,
+             ymin = 0,      ymax = 1,
+             fill = "grey", alpha = 0.45) +
+    annotate("segment",
+             x = q3_len, xend = q3_len, y = 0, yend = 1,
+             linetype = "dashed", colour = "firebrick", linewidth = 0.6) +
+    scale_x_log10(
+      breaks = c(1, 10, 100, 1000, 10000),
+      labels = c("1", "10", "100", "1000", "10000")
+    ) +
+    scale_color_manual(
+      values = mycols,
+      labels = scales::label_parse(),
+      name   = "Mode"
+    ) +
+    scale_linetype_manual(
+      values = c("Empirical" = "solid", "Markov prediction" = "dashed"),
+      name = NULL
+    ) +
+    labs(
+      title = paste(specie),
+      x = expression(tau),
+      y = expression("|" * lambda[i]^tau * "|")
+    ) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_classic(base_size = 13) +
+    theme(
+      plot.title       = element_text(face="bold", hjust=0.5),
+      legend.position  = "right",
+      panel.grid.major = element_line(color="grey92"),
+      axis.line        = element_line(color="grey40")
+    )
+  
+  print(p)
+}
+```
+
+## 5.1. Length-Collapsed Version 
+
+```{r 5.1}
+#### functions ####
+
+lagT <- function(seqs, tau) {
+  
+  states <- sort(unique(unlist(seqs)))
+  n <- length(states)
+  state_idx <- setNames(seq_along(states), states)
+  
+  mat <- matrix(0, nrow=n, ncol=n, dimnames=list(states, states))
+  
+  for (seq in seqs) {
+    if (length(seq) <= tau) next
+    
+    #create transition matrix at lag tau
+    for (i in 1:(length(seq) - tau)) {
+      from <- as.character(seq[i])
+      to   <- as.character(seq[i + tau])
+      mat[from, to] <- mat[from, to] + 1
+    }
+  }
+  
+  #row-normalize (rows = "from" states)
+  row_sums <- rowSums(mat)
+  mat <- mat / ifelse(row_sums > 0, row_sums, 1)
+  return(mat)
+}
+
+#first order markov tau is just T(1)^tau
+matrixPower <- function(M, tau) {
+  result <- diag(nrow(M))
+  base <- M
+  while (tau > 0) {
+    if (tau %% 2 == 1) result <- result %*% base
+    base <- base %*% base
+    tau <- tau %/% 2
+  }
+  return(result)
+}
+
+#### visualizations ####
+
+tau_values <- c(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
+n_modes <- 5  # plot top 5 non-trivial eigenvalues (mu = 2..6 in paper)
+
+speciesList <- c('bre', 'mil', 'mul', 'oce', 'orn', 'pul')
+
+colors <- paletteer_d("rcartocolor::Prism")
+mycols <- colors[4:9]
+
+for (specie in speciesList) {
+  dat3 <- dat %>%
+    filter(species == specie) %>%
+    arrange(trial_id, sequence_id, fish_id, order_id)
+  
+  trueSeqs <- dat3 %>%
+    group_by(trial_id, sequence_id, fish_id) %>%
+    summarise(series = list(as.character(state)), .groups = "drop") %>%
+    pull(series)
+  
+  #T(1) empirical
+  P1 <- lagT(trueSeqs, tau = 1)
+  
+  #init
+  eig_empirical <- matrix(NA, nrow=length(tau_values), ncol=n_modes)
+  eig_markov    <- matrix(NA, nrow=length(tau_values), ncol=n_modes)
+  
+  for (k in seq_along(tau_values)) {
+    tau <- tau_values[k]
+    
+    Ptau <- lagT(trueSeqs, tau)
+    
+    ev_emp <- sort(Mod(eigen(Ptau, only.values=TRUE)$values), decreasing=TRUE)
+    eig_empirical[k, ] <- ev_emp[2:(n_modes+1)]
+    
+    ev_1 <- sort(Mod(eigen(P1, only.values=TRUE)$values), decreasing=TRUE)
+    eig_markov[k, ] <- ev_1[2:(n_modes+1)]^tau
+  }
+  
+  # Build tidy long-format data frames
+  mode_labels <- paste0("mu==", 2:(n_modes+1))
+  
+  df_emp <- as.data.frame(eig_empirical) %>%
+    setNames(mode_labels) %>%
+    mutate(tau = tau_values) %>%
+    pivot_longer(-tau, names_to="mode", values_to="lambda") %>%
+    mutate(type = "Empirical")
+  
+  df_mkv <- as.data.frame(eig_markov) %>%
+    setNames(mode_labels) %>%
+    mutate(tau = tau_values) %>%
+    pivot_longer(-tau, names_to="mode", values_to="lambda") %>%
+    mutate(type = "Markov prediction")
+  
+  df_plot <- bind_rows(df_emp, df_mkv)
+  
+  p <- ggplot(df_plot, aes(x=tau, y=lambda, color=mode, linetype=type, group=interaction(mode, type))) +
+    geom_line(linewidth=0.8) +
+    geom_point(data = filter(df_plot, type == "Empirical"), size=2) +
+    scale_x_log10(
+      breaks = c(1, 10, 100, 1000),
+      labels = c("1", "10", "100", "1000")
+    ) +
+    scale_color_manual(
+      values = mycols,
+      labels = scales::label_parse(),
+      name   = "Mode"
+    )+
+    scale_linetype_manual(
+      values = c("Empirical" = "solid", "Markov prediction" = "dashed"),
+      name = NULL
+    ) +
+    labs(
+      title = paste("Eigenvalue decay: ", specie),
+      x = expression("log10(" * tau * ")"),
+      y = expression("|" * lambda * "|")
+    ) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_classic(base_size = 13) +
+    theme(
+      plot.title    = element_text(face="bold", hjust=0.5),
+      legend.position = "right",
+      panel.grid.major = element_line(color="grey92"),
+      axis.line     = element_line(color="grey40")
+    )
+  
+  print(p)
+}
+```
+
+# 6. Marginal State Distributions
+
+```{r 6}
+#### ── Transition Probability Stream Graph ────────────────────────────────── ####
+
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(paletteer)
+library(scales)
+
+#### ── Helpers ────────────────────────────────────────────────────────────── ####
+
+lagT <- function(seqs, tau) {
+  states   <- sort(unique(unlist(seqs)))
+  n        <- length(states)
+  mat      <- matrix(0, nrow = n, ncol = n, dimnames = list(states, states))
+  for (seq in seqs) {
+    if (length(seq) <= tau) next
+    for (i in 1:(length(seq) - tau)) {
+      from <- as.character(seq[i])
+      to   <- as.character(seq[i + tau])
+      mat[from, to] <- mat[from, to] + 1
+    }
+  }
+  row_sums <- rowSums(mat)
+  mat / ifelse(row_sums > 0, row_sums, 1)
+}
+
+make_ribbon_df <- function(df, state_order) {
+  df %>%
+    mutate(state = factor(state, levels = state_order)) %>%
+    arrange(tau_log, state) %>%
+    group_by(tau_log) %>%
+    mutate(
+      prob = prob / sum(prob),
+      ymax = cumsum(prob),
+      ymin = ymax - prob
+    ) %>%
+    ungroup()
+}
+
+#### ── Parameters ─────────────────────────────────────────────────────────── ####
+
+tau_stream  <- c(1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 7500, 10000, 15000)
+speciesList <- c('bre', 'mil', 'mul', 'oce', 'orn', 'pul')
+
+colors_all  <- paletteer_d("rcartocolor::Prism")
+state_order <- c('a','b','c','d','e','f','g','h','j','k')
+state_cols  <- setNames(colors_all[1:10], rev(state_order))
+
+x_breaks <- log10(c(1, 10, 100, 1000, 10000))
+x_labels <- c("1", "10", "100", "1,000", "10,000")
+
+#### ── Main loop ──────────────────────────────────────────────────────────── ####
+
+for (specie in speciesList) {
+
+  cat("Processing:", specie, "\n")
+
+  dat3 <- dat %>%
+    filter(species == specie) %>%
+    arrange(trial_id, sequence_id, fish_id, order_id)
+
+  trueSeqs <- dat3 %>%
+    group_by(trial_id, sequence_id, fish_id) %>%
+    summarise(series = list(as.character(rep(state, length))), .groups = "drop") %>%
+    pull(series)
+
+  states <- sort(unique(unlist(trueSeqs)))
+
+  # Q3 cutoff
+  q3_len     <- quantile(sapply(trueSeqs, length), 0.75)
+  cutoff_log <- log10(q3_len)
+
+  ## ── 1. Baseline marginal (τ = 0) ───────────────────────────────────────── ##
+  all_obs  <- unlist(trueSeqs)
+  baseline <- as.numeric(table(factor(all_obs, levels = states)) / length(all_obs))
+  names(baseline) <- states
+
+  ## ── 2. Marginal P(state @ τ) ────────────────────────────────────────────── ##
+  stream_rows <- map_dfr(tau_stream, function(tau) {
+    Ptau <- lagT(trueSeqs, tau)
+    tibble(
+      tau     = tau,
+      tau_log = log10(tau),
+      state   = colnames(Ptau),
+      prob    = as.numeric(baseline %*% Ptau)
+    )
+  })
+
+  df_ribbon <- make_ribbon_df(stream_rows, state_order)
+
+  ## ── 3. Baseline bar data ────────────────────────────────────────────────── ##
+  baseline_df <- tibble(
+    state = factor(states, levels = state_order),
+    prob  = baseline[states]
+  ) %>%
+    arrange(state) %>%
+    mutate(ymax = cumsum(prob), ymin = ymax - prob)
+
+  ## ── 4. Baseline bar ─────────────────────────────────────────────────────── ##
+  p_bar <- ggplot(baseline_df, aes(fill = state)) +
+    geom_rect(aes(xmin = 0.1, xmax = 0.9, ymin = ymin, ymax = ymax),
+              colour = "white", linewidth = 0.3) +
+    geom_text(aes(x = 0.5, y = (ymin + ymax) / 2,
+                  label = percent(prob, accuracy = 1)),
+              size = 3, fontface = "bold", colour = "white") +
+    scale_fill_manual(values = state_cols, guide = "none") +
+    scale_x_continuous(limits = c(0, 1), breaks = NULL) +
+    labs(x = NULL, y = "P(state)") +
+    theme_classic(base_size = 11) +
+    theme(
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.line.x  = element_blank(),
+      plot.margin  = margin(t = 5, r = 0, b = 5, l = 5),
+      axis.ticks.y = element_blank(),
+      axis.text.y  = element_blank()
+    )
+
+  ## ── 5. Ribbon plot ──────────────────────────────────────────────────────── ##
+  p_stream <- ggplot(df_ribbon,
+                     aes(x = tau_log, ymin = ymin, ymax = ymax, fill = state)) +
+    geom_ribbon(colour = "white", linewidth = 0.25, alpha = 0.92) +
+    annotate("rect",
+             xmin = cutoff_log, xmax = log10(max(tau_stream)),
+             ymin = 0, ymax = 1,
+             fill = "white", alpha = 0.45) +
+    annotate("segment",
+             x = cutoff_log, xend = cutoff_log, y = 0, yend = 1,
+             linetype = "dashed", colour = "firebrick", linewidth = 0.6) +
+    scale_fill_manual(values = state_cols, name = "State",
+                      breaks = rev(state_order)) +
+    scale_x_continuous(breaks = x_breaks, labels = x_labels, expand = c(0.01, 0)) +
+    labs(
+      x     = expression(tau),
+      y     = expression(P(state ~ "@" ~ tau)),
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 12),
+      legend.position = "right",
+      axis.line       = element_line(colour = "grey40"),
+      plot.margin     = margin(t = 5, r = 5, b = 5, l = 0),
+      axis.ticks.y    = element_blank(),
+      axis.text.y     = element_blank()
+    )
+
+  ## ── 6. Assemble ─────────────────────────────────────────────────────────── ##
+  final_plot <- wrap_elements(full = p_bar) + wrap_elements(full = p_stream) +
+    plot_layout(widths = c(1, 9)) +
+    plot_annotation(
+      title = specie,
+      theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5))
+    )
+
+  print(final_plot)
+
+}
+```
+
+```{r complicated}
+#### ── Transition Probability Stream Graph + Companion Heatmap ────────────── ####
+
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(paletteer)
+library(scales)
+
+#### ── Helpers ────────────────────────────────────────────────────────────── ####
+
+lagT <- function(seqs, tau) {
+  states   <- sort(unique(unlist(seqs)))
+  n        <- length(states)
+  mat      <- matrix(0, nrow = n, ncol = n, dimnames = list(states, states))
+  for (seq in seqs) {
+    if (length(seq) <= tau) next
+    for (i in 1:(length(seq) - tau)) {
+      from <- as.character(seq[i])
+      to   <- as.character(seq[i + tau])
+      mat[from, to] <- mat[from, to] + 1
+    }
+  }
+  row_sums <- rowSums(mat)
+  mat / ifelse(row_sums > 0, row_sums, 1)
+}
+
+matrixPower <- function(M, tau) {
+  result <- diag(nrow(M))
+  base   <- M
+  while (tau > 0) {
+    if (tau %% 2 == 1) result <- result %*% base
+    base <- base %*% base
+    tau  <- tau %/% 2
+  }
+  result
+}
+
+make_ribbon_df <- function(df, state_order) {
+  df %>%
+    mutate(state = factor(state, levels = state_order)) %>%
+    arrange(tau_log, state) %>%
+    group_by(tau_log) %>%
+    mutate(
+      prob = prob / sum(prob),
+      ymax = cumsum(prob),
+      ymin = ymax - prob
+    ) %>%
+    ungroup()
+}
+
+lagT_coverage <- function(seqs, tau) {
+  n_contributing <- sum(sapply(seqs, function(s) length(s) > tau))
+  n_total        <- length(seqs)
+  list(
+    n_pairs       = sum(sapply(seqs, function(s) max(0, length(s) - tau))),
+    n_seq         = n_contributing,
+    coverage      = n_contributing / n_total
+  )
+}
+
+#### ── Parameters ─────────────────────────────────────────────────────────── ####
+
+tau_stream  <- c(1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 7500, 10000, 15000)
+tau_heat    <- c(1, 100, 1000, 5000, 10000)
+speciesList <- c('bre', 'mil', 'mul', 'oce', 'orn', 'pul')
+
+colors_all  <- paletteer_d("rcartocolor::Prism")
+state_order <- c('a','b','c','d','e','f','g','h','j','k')
+state_cols  <- setNames(colors_all[1:10], rev(state_order))
+
+x_breaks <- log10(c(1, 10, 100, 1000, 10000))
+x_labels <- c("1", "10", "100", "1,000", "10,000")
+
+#### ── Main loop ──────────────────────────────────────────────────────────── ####
+
+for (specie in speciesList) {
+
+  cat("Processing:", specie, "\n")
+
+  dat3 <- dat %>%
+    filter(species == specie) %>%
+    arrange(trial_id, sequence_id, fish_id, order_id)
+
+  trueSeqs <- dat3 %>%
+    group_by(trial_id, sequence_id, fish_id) %>%
+    summarise(series = list(as.character(rep(state, length))), .groups = "drop") %>%
+    pull(series)
+
+  states <- sort(unique(unlist(trueSeqs)))
+
+  ## ── 1. Baseline marginal (τ = 0) ───────────────────────────────────────── ##
+  all_obs  <- unlist(trueSeqs)
+  baseline <- as.numeric(table(factor(all_obs, levels = states)) / length(all_obs))
+  names(baseline) <- states
+
+  ## ── 2. Marginal P(state @ τ) ────────────────────────────────────────────── ##
+  stream_rows <- map_dfr(tau_stream, function(tau) {
+    Ptau <- lagT(trueSeqs, tau)
+    tibble(
+      tau     = tau,
+      tau_log = log10(tau),
+      state   = colnames(Ptau),
+      prob    = as.numeric(baseline %*% Ptau)
+    )
+  })
+
+  df_ribbon <- make_ribbon_df(stream_rows, state_order)
+  
+  # Build coverage data alongside stream_rows
+  coverage_rows <- map_dfr(tau_stream, function(tau) {
+    cv <- lagT_coverage(trueSeqs, tau)
+    tibble(
+      tau          = tau,
+      tau_log      = log10(tau),
+      n_pairs      = cv$n_pairs,
+      n_seq        = cv$n_seq,
+      coverage     = cv$coverage
+    )
+  })
+  
+  # Coverage threshold — grey out or truncate below this
+  coverage_thresh <- 0.5
+
+  ## ── 3. Baseline bar data ────────────────────────────────────────────────── ##
+  baseline_df <- tibble(
+    state = factor(states, levels = state_order),
+    prob  = baseline[states]
+  ) %>%
+    arrange(state) %>%
+    mutate(ymax = cumsum(prob), ymin = ymax - prob)
+
+  ## ── 4. Heatmap data ─────────────────────────────────────────────────────── ##
+  df_heat <- map_dfr(tau_heat, function(tau) {
+    Ptau <- lagT(trueSeqs, tau)
+    as.data.frame(as.table(Ptau)) %>%
+      rename(from = Var1, to = Var2, prob = Freq) %>%
+      mutate(tau = tau)
+  }) %>%
+    mutate(
+      tau_label = paste0("tau == ", tau),
+      tau_label = factor(tau_label, levels = paste0("tau == ", tau_heat))
+    )
+
+  ## ── 5. Baseline bar ─────────────────────────────────────────────────────── ##
+p_bar <- ggplot(baseline_df, aes(fill = state)) +
+    geom_rect(aes(xmin = 0.1, xmax = 0.9, ymin = ymin, ymax = ymax),
+              colour = "white", linewidth = 0.3) +
+    geom_text(aes(x = 0.5, y = (ymin + ymax) / 2,
+                  label = percent(prob, accuracy = 1)),
+              size = 3, fontface = "bold", colour = "white") +
+    scale_fill_manual(values = state_cols, guide = "none") +
+    scale_x_continuous(limits = c(0, 1), breaks = NULL) +
+    #scale_y_continuous(limits = c(0, 1), expand = c(0, 0),
+                       #labels = percent_format(accuracy = 1)) +
+    labs(x = NULL, y = "P(state)") +
+    theme_classic(base_size = 11) +
+    theme(
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.line.x  = element_blank(),
+      plot.margin  = margin(t = 5, r = 0, b = 5, l = 5),
+      axis.ticks.y       = element_blank(),
+      axis.text.y = element_blank()
+    )
+
+  ## ── 6. Ribbon plot ──────────────────────────────────────────────────────── ##
+  p_stream <- ggplot(df_ribbon,
+                     aes(x = tau_log, ymin = ymin, ymax = ymax, fill = state)) +
+    geom_ribbon(colour = "white", linewidth = 0.25, alpha = 0.92) +
+    scale_fill_manual(values = state_cols, name = "State",
+                      breaks = rev(state_order)) +
+    scale_x_continuous(breaks = x_breaks, labels = x_labels, expand = c(0.01, 0)) +
+    #scale_y_continuous(limits = c(0, 1), expand = c(0, 0),
+                       #labels = percent_format(accuracy = 1)) +
+    labs(
+      x     = expression(tau),
+      y     = expression(P(state ~ "@" ~ tau)),
+      title = paste("Marginal State Probabilities over Time: ", specie)
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title         = element_text(face = "bold", hjust = 0.5, size = 12),
+      legend.position    = "right",
+      #panel.grid.major.y = element_line(colour = "grey92"),
+      axis.line          = element_line(colour = "grey40"),
+      plot.margin        = margin(t = 5, r = 5, b = 5, l = 0),
+      axis.ticks.y       = element_blank(),
+      axis.text.y = element_blank()
+    )
+  
+  #coverage plot
+  p_coverage <- ggplot(coverage_rows, aes(x = tau_log, y = coverage)) +
+  geom_area(fill = "grey70", alpha = 0.5) +
+  geom_line(colour = "grey30", linewidth = 0.7) +
+  geom_hline(yintercept = coverage_thresh, linetype = "dashed",
+             colour = "firebrick", linewidth = 0.6) +
+  annotate("text", x = min(coverage_rows$tau_log), y = coverage_thresh + 0.03,
+           label = paste0(coverage_thresh * 100, "% threshold"),
+           hjust = 0, size = 3, colour = "firebrick") +
+  scale_x_continuous(breaks = x_breaks, labels = x_labels, expand = c(0.01, 0)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0),
+                     labels = percent_format(accuracy = 1)) +
+  labs(x = expression(tau), y = "Seq. coverage") +
+  theme_classic(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_line(colour = "grey92"),
+    axis.line          = element_line(colour = "grey40"),
+    plot.margin        = margin(t = 0, r = 5, b = 5, l = 0)
+  )
+  
+  cutoff_log <- coverage_rows %>%
+  filter(coverage < coverage_thresh) %>%
+  slice_min(tau_log, n = 1) %>%
+  pull(tau_log)
+  
+  if (length(cutoff_log) > 0) {
+  p_stream <- p_stream +
+    annotate("rect",
+             xmin = cutoff_log, xmax = max(coverage_rows$tau_log),
+             ymin = 0, ymax = 1,
+             fill = "white", alpha = 0.45) +
+    annotate("segment",
+             x = cutoff_log, xend = cutoff_log, y = 0, yend = 1,
+             linetype = "dashed", colour = "firebrick", linewidth = 0.6)
+  }
+  
+  p_combined <- wrap_elements(full = p_bar) + wrap_elements(full = p_stream) +
+  plot_layout(widths = c(1, 9))
+
+
+
+  ## ── 7. Heatmap ──────────────────────────────────────────────────────────── ##
+  p_heat <- ggplot(df_heat,
+                   aes(x = from, y = fct_rev(to), fill = prob)) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    # geom_text(
+    #   aes(label = if_else(prob >= 0.05, sprintf("%.2f", prob), "")),
+    #   size = 2.5, colour = "white", fontface = "bold"
+    # ) +
+    facet_wrap(~tau_label, nrow = 1, labeller = label_parsed) +
+    scale_fill_paletteer_c("ggthemes::Red-Gold", name = "P(next @ τ|prev)") +
+    labs(x = "Next state", y = "Prev state",
+         title = paste("Conditional transition matrices: ", specie)) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title       = element_text(face = "bold", hjust = 0.5, size = 12),
+      strip.background = element_rect(fill = "grey20", colour = NA),
+      strip.text       = element_text(colour = "white", face = "bold", size = 10),
+      axis.text        = element_text(size = 9),
+      panel.spacing    = unit(0.4, "lines"),
+      legend.position  = "right"
+    )
+
+  ## ── 8. Assemble with wrap_elements() ────────────────────────────────────── ##
+  # wrap_elements() bypasses patchwork's add_guides() path that triggers
+  # the Ops.data.frame bug in patchwork 1.1.3 + ggplot2 3.5.x.
+  p_combined <- wrap_elements(full = p_bar) + wrap_elements(full = p_stream) +
+    plot_layout(widths = c(1, 9))
+
+  final_plot <- wrap_elements(full = p_combined) /
+              wrap_elements(full = p_heat) /
+              wrap_elements(full = p_coverage) +
+  plot_layout(heights = c(2, 1.4, 0.6)) +
+  plot_annotation(
+    title = specie,
+    theme = theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5))
+  )
+
+  print(final_plot)
+
+  # ggsave(paste0("transition_", specie, ".pdf"), final_plot, width = 14, height = 9)
+}
+
+#### ── Optional: anchor-conditioned small multiples ─────────────────────── ####
+# anchor_ribbon_plot <- function(trueSeqs, anchor_state, tau_values,
+#                                state_cols, state_order) {
+#   states    <- sort(unique(unlist(trueSeqs)))
+#   pi_anchor <- setNames(as.numeric(states == anchor_state), states)
+#   rows <- map_dfr(tau_values, function(tau) {
+#     Ptau <- lagT(trueSeqs, tau)
+#     tibble(tau=tau, tau_log=log10(tau), state=colnames(Ptau),
+#            prob=as.numeric(pi_anchor %*% Ptau))
+#   })
+#   df_r <- make_ribbon_df(rows, state_order)
+#   ggplot(df_r, aes(x=tau_log, ymin=ymin, ymax=ymax, fill=state)) +
+#     geom_ribbon(colour="white", linewidth=0.25, alpha=0.92) +
+#     scale_fill_manual(values=state_cols, name="State", breaks=rev(state_order)) +
+#     scale_x_continuous(breaks=log10(c(1,10,100,1000,10000)),
+#                        labels=c("1","10","100","1,000","10,000")) +
+#     scale_y_continuous(limits=c(0,1), expand=c(0,0),
+#                        labels=percent_format(accuracy=1)) +
+#     labs(title=paste0("P(state @ τ | start = '", anchor_state, "')"),
+#          x=expression(tau), y="Probability") +
+#     theme_classic(base_size=11)
+# }
+# sm_plots <- map(states, ~anchor_ribbon_plot(trueSeqs, .x, tau_stream,
+#                                              state_cols, state_order))
+# wrap_plots(sm_plots, ncol=5) + plot_layout(guides="collect")
+```
+
+
+
