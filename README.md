@@ -11,7 +11,7 @@ project_folder/
 ├── PrettyDat.csv
 ├── preprocessing.ipynb
 ├── SamplingAndSims.ipynb
-├── rAnalyses.rmd
+├── rAnalysis.rmd
 ```
 
 ## Usage Guide
@@ -28,7 +28,7 @@ Run `preprocessing.ipynb` to generate species-specific corpora from the raw data
 Statistical summaries and eigenvalue decay analyses are implemented in:
 
 ```
-rAnalyses.rmd
+rAnalysis.rmd
 ```
 
 This script produces:
